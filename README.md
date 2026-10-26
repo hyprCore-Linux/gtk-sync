@@ -72,3 +72,7 @@ gtk-sync-client versions --json path/to/file.txt
 | `scripts/` | CouchDB helper, smoke test |
 
 Default HTTPS port **8443**.
+
+## License
+
+GNU General Public License v3.0. See [LICENSE](LICENSE).
