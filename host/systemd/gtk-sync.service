@@ -1,0 +1,18 @@
+[Unit]
+Description=gtk-sync server
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gtk-sync run --config /etc/gtk-sync/server.toml
+Restart=always
+RestartSec=3
+# Placeholders replaced at install with the installing login user so the
+# storage folder (often under $HOME) stays readable/writable by that user.
+User=__MIMIC_USER__
+Group=__MIMIC_GROUP__
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

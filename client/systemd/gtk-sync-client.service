@@ -1,0 +1,13 @@
+[Unit]
+Description=gtk-sync client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gtk-sync-client run --config %h/.config/gtk-sync/client.toml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

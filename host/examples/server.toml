@@ -1,0 +1,19 @@
+# Example GTK-Sync server config (/etc/gtk-sync/server.toml)
+
+root = "/var/lib/gtk-sync"
+listen_addr = "0.0.0.0"
+port = 8443
+retention_hours = 24
+username = "mimic"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE"
+peer_password = "replace-me"
+cert_path = "/var/lib/gtk-sync/cert.pem"
+key_path = "/var/lib/gtk-sync/key.pem"
+instance_name = "gtk-sync-host-1"
+data_dir = "/var/lib/gtk-sync"
+
+# Metadata (replaces index.json) — one CouchDB doc per file / version / tombstone
+couch_url = "http://127.0.0.1:5984"
+couch_db = "gtk-sync"
+couch_user = "admin"
+couch_password = "replace-me"
