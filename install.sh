@@ -79,9 +79,9 @@ prompt_cli() {
 prompt_zenity_role() {
   # Prefer the settings-style card dialog when available.
   local choice=""
-  if [[ -f /usr/share/neuronix/neuronix_choice_dialog.py ]]; then
+  if [[ -f /usr/share/hyprcore/hyprcore_choice_dialog.py ]]; then
     choice="$(
-      python3 /usr/share/neuronix/neuronix_choice_dialog.py \
+      python3 /usr/share/hyprcore/hyprcore_choice_dialog.py \
         "Setup Sync" \
         "Choose how this computer will use Sync — each option continues setup." \
         "server|Server|Host the sync library on this machine" \

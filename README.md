@@ -3,7 +3,7 @@
 LAN file sync (client + server) for the hyprCore Linux GTK apps. Originally MimicFS; packaged here as **gtk-sync**.
 
 On hyprCore Linux desktops, gtk-files **Setup Sync** launches this tree from
-`/usr/local/lib/neuronix/gtk-apps/gtk-sync/` (populated by `syn-to-devices.sh`
+`/usr/local/lib/hyprcore/gtk-apps/gtk-sync/` (populated by `syn-to-devices.sh`
 with prebuilt `target/release/` binaries so cargo is not required on the ISO).
 
 Clients push/pull over **HTTPS (TLS)** with a shared username/password. Servers keep timestamped history in CouchDB + on-disk blobs (default retention **24 hours**).
