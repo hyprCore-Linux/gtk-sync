@@ -1,6 +1,7 @@
 use crate::couch::CouchStore;
+use anyhow::Context;
 use mimic_core::config::ServerConfig;
-use mimic_core::index::{index_path, versions_dir, FileIndex};
+use mimic_core::index::{index_path, versions_dir, FileEntry, FileIndex};
 use mimic_core::versioning::{content_hash, versioned_filename};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,7 +39,11 @@ impl AppState {
         let legacy = index_path(&data);
         if legacy.exists() {
             match FileIndex::load(&legacy) {
-                Ok(idx) if !idx.files.is_empty() || !idx.history.is_empty() || !idx.tombstones.is_empty() => {
+                Ok(idx)
+                    if !idx.files.is_empty()
+                        || !idx.history.is_empty()
+                        || !idx.tombstones.is_empty() =>
+                {
                     tracing::info!("migrating {} to CouchDB…", legacy.display());
                     let n = couch.import_file_index(&idx).await?;
                     let bak = data.join("index.json.migrated");
@@ -73,40 +78,15 @@ impl AppState {
         rel_path: &str,
         data: &[u8],
         ts: Option<u64>,
-    ) -> anyhow::Result<mimic_core::index::FileEntry> {
+    ) -> anyhow::Result<FileEntry> {
+        let rel_path = rel_path.to_string();
+        let data = data.to_vec();
+        let versions = self.versions.clone();
         let ts = ts.unwrap_or_else(FileIndex::now_ts);
-        let hash = content_hash(data);
-        let file_name = Path::new(rel_path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(rel_path);
-        let stored_name = if let Some(parent) = Path::new(rel_path).parent() {
-            if parent.as_os_str().is_empty() {
-                versioned_filename(file_name, ts)
-            } else {
-                format!(
-                    "{}/{}",
-                    parent.to_string_lossy().replace('\\', "/"),
-                    versioned_filename(file_name, ts)
-                )
-            }
-        } else {
-            versioned_filename(file_name, ts)
-        };
-
-        let dest = self.versions.join(&stored_name);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&dest, data)?;
-
-        let entry = mimic_core::index::FileEntry {
-            path: rel_path.replace('\\', "/"),
-            ts,
-            hash,
-            size: data.len() as u64,
-            stored_name,
-        };
+        let entry =
+            tokio::task::spawn_blocking(move || store_blob_sync(&versions, &rel_path, &data, ts))
+                .await
+                .context("store blob task")??;
         self.couch.put_version(&entry).await?;
         Ok(entry)
     }
@@ -117,6 +97,50 @@ impl AppState {
             .get_version(path, ts)
             .await?
             .ok_or_else(|| anyhow::anyhow!("version not found: {path}@{ts}"))?;
-        Ok(std::fs::read(self.versions.join(&entry.stored_name))?)
+        let path = self.versions.join(&entry.stored_name);
+        tokio::task::spawn_blocking(move || std::fs::read(path))
+            .await
+            .context("read blob task")?
+            .map_err(Into::into)
     }
+}
+
+fn store_blob_sync(
+    versions: &Path,
+    rel_path: &str,
+    data: &[u8],
+    ts: u64,
+) -> anyhow::Result<FileEntry> {
+    let hash = content_hash(data);
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(rel_path);
+    let stored_name = if let Some(parent) = Path::new(rel_path).parent() {
+        if parent.as_os_str().is_empty() {
+            versioned_filename(file_name, ts)
+        } else {
+            format!(
+                "{}/{}",
+                parent.to_string_lossy().replace('\\', "/"),
+                versioned_filename(file_name, ts)
+            )
+        }
+    } else {
+        versioned_filename(file_name, ts)
+    };
+
+    let dest = versions.join(&stored_name);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&dest, data)?;
+
+    Ok(FileEntry {
+        path: rel_path.replace('\\', "/"),
+        ts,
+        hash,
+        size: data.len() as u64,
+        stored_name,
+    })
 }

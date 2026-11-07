@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Disk writes of the whole files map are coalesced to a few times per second.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActiveTransfer {
@@ -50,6 +53,8 @@ struct StatusInner {
     path: PathBuf,
     /// Paths whose blob 404'd at a given remote ts — skip pending/retry until ts changes.
     unavailable: BTreeMap<String, u64>,
+    last_flush: Option<Instant>,
+    dirty: bool,
 }
 
 fn now_ts() -> u64 {
@@ -66,6 +71,8 @@ fn global() -> &'static Mutex<StatusInner> {
             status: ClientStatus::default(),
             path: default_status_path(),
             unavailable: BTreeMap::new(),
+            last_flush: None,
+            dirty: false,
         })
     })
 }
@@ -83,10 +90,21 @@ pub fn default_status_path() -> PathBuf {
 
 pub fn init() {
     let _ = global();
-    write_now();
+    if let Ok(mut g) = global().lock() {
+        persist(&mut g);
+    }
 }
 
-fn write_locked(inner: &mut StatusInner) {
+fn flush_due(inner: &StatusInner) -> bool {
+    match inner.last_flush {
+        None => true,
+        Some(at) => at.elapsed() >= FLUSH_INTERVAL,
+    }
+}
+
+fn persist(inner: &mut StatusInner) {
+    inner.dirty = false;
+    inner.last_flush = Some(Instant::now());
     inner.status.updated_at = now_ts();
     if let Some(parent) = inner.path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -100,9 +118,23 @@ fn write_locked(inner: &mut StatusInner) {
     }
 }
 
-fn write_now() {
+/// Write the in-memory status immediately, or remember that a later flush must.
+fn write_locked(inner: &mut StatusInner, force: bool) {
+    inner.status.updated_at = now_ts();
+    if force || flush_due(inner) {
+        persist(inner);
+    } else {
+        inner.dirty = true;
+    }
+}
+
+/// Persist a coalesced update. The daemon calls this a few times a second so the
+/// last transfer in a burst still reaches gtk-files.
+pub fn flush() {
     if let Ok(mut g) = global().lock() {
-        write_locked(&mut g);
+        if g.dirty {
+            persist(&mut g);
+        }
     }
 }
 
@@ -113,7 +145,7 @@ pub fn set_phase(phase: &str, busy: bool) {
         if !busy {
             g.status.active.clear();
         }
-        write_locked(&mut g);
+        write_locked(&mut g, true);
     }
 }
 
@@ -130,7 +162,7 @@ pub fn mark_pending(paths: &[String]) {
             }
             g.status.files.insert(path.clone(), "pending".into());
         }
-        write_locked(&mut g);
+        write_locked(&mut g, false);
     }
 }
 
@@ -148,7 +180,7 @@ pub fn begin_transfer(path: &str, direction: &str) {
             direction: direction.to_string(),
         });
         g.status.files.insert(path.to_string(), "syncing".into());
-        write_locked(&mut g);
+        write_locked(&mut g, false);
     }
 }
 
@@ -175,7 +207,7 @@ pub fn end_transfer(path: &str, final_state: &str) {
                 g.status.phase = "idle".into();
             }
         }
-        write_locked(&mut g);
+        write_locked(&mut g, false);
     }
 }
 
@@ -186,12 +218,16 @@ pub fn mark_unavailable(path: &str, ts: u64) {
         g.status.files.remove(path);
         g.status.active.retain(|a| a.path != path);
         if g.status.active.is_empty()
-            && !g.status.files.values().any(|s| s == "pending" || s == "syncing")
+            && !g
+                .status
+                .files
+                .values()
+                .any(|s| s == "pending" || s == "syncing")
         {
             g.status.busy = false;
             g.status.phase = "idle".into();
         }
-        write_locked(&mut g);
+        write_locked(&mut g, false);
     }
 }
 
@@ -230,8 +266,7 @@ pub fn publish_tombstones(tombstones: &[Tombstone]) {
     if let Ok(mut g) = global().lock() {
         let next = filter_superseded_tombstones(tombstones_to_status(tombstones), &g.status.files);
         if g.status.tombstones.len() == next.len()
-            && g
-                .status
+            && g.status
                 .tombstones
                 .iter()
                 .zip(next.iter())
@@ -248,7 +283,7 @@ pub fn publish_tombstones(tombstones: &[Tombstone]) {
             g.status.files.insert(t.path.clone(), "deleted".into());
         }
         g.status.tombstones = next;
-        write_locked(&mut g);
+        write_locked(&mut g, true);
     }
 }
 
@@ -260,9 +295,9 @@ fn filter_superseded_tombstones(
         .into_iter()
         .filter(|t| {
             let prefix = format!("{}/", t.path);
-            !files.iter().any(|(p, state)| {
-                state != "deleted" && (*p == t.path || p.starts_with(&prefix))
-            })
+            !files
+                .iter()
+                .any(|(p, state)| state != "deleted" && (*p == t.path || p.starts_with(&prefix)))
         })
         .collect()
 }
@@ -280,7 +315,7 @@ pub fn note_tombstone(path: &str, ts: u64) {
                 kind: "delete".into(),
             });
         }
-        write_locked(&mut g);
+        write_locked(&mut g, false);
     }
 }
 
@@ -303,9 +338,9 @@ pub fn clear_tombstones_under(prefix: &str) {
             }
         }
         let prefix_slash = format!("{prefix}/");
-        g.status.tombstones.retain(|t| {
-            t.path != prefix && !t.path.starts_with(&prefix_slash)
-        });
+        g.status
+            .tombstones
+            .retain(|t| t.path != prefix && !t.path.starts_with(&prefix_slash));
         // Drop ancestor folder tombstones too (same as server restore-tree).
         let mut ancestor = prefix;
         while let Some((parent, _)) = ancestor.rsplit_once('/') {
@@ -320,15 +355,12 @@ pub fn clear_tombstones_under(prefix: &str) {
                 }
             }
         }
-        write_locked(&mut g);
+        write_locked(&mut g, true);
     }
 }
 
 /// Replace the files map and tombstones after a full reconcile.
-pub fn publish_reconcile(
-    files: BTreeMap<String, String>,
-    tombstones: &[Tombstone],
-) {
+pub fn publish_reconcile(files: BTreeMap<String, String>, tombstones: &[Tombstone]) {
     if let Ok(mut g) = global().lock() {
         // Keep in-flight / still-queued marks from the previous snapshot.
         let active_paths: Vec<String> = g.status.active.iter().map(|a| a.path.clone()).collect();
@@ -356,9 +388,9 @@ pub fn publish_reconcile(
         }
         for t in tombstones {
             let prefix = format!("{}/", t.path);
-            let has_live = files.iter().any(|(p, state)| {
-                state != "deleted" && (*p == t.path || p.starts_with(&prefix))
-            });
+            let has_live = files
+                .iter()
+                .any(|(p, state)| state != "deleted" && (*p == t.path || p.starts_with(&prefix)));
             if has_live {
                 continue;
             }
@@ -371,7 +403,7 @@ pub fn publish_reconcile(
             g.status.busy = false;
             g.status.phase = "idle".into();
         }
-        write_locked(&mut g);
+        write_locked(&mut g, true);
     }
 }
 

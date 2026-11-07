@@ -16,7 +16,7 @@ use mimic_core::protocol::*;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
@@ -46,9 +46,9 @@ pub async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
                     _ => {}
                 }
                 match st.couch.drop_missing_blobs(&st.versions).await {
-                    Ok(n) if n > 0 => tracing::warn!(
-                        "dropped {n} index entries whose blobs are missing on disk"
-                    ),
+                    Ok(n) if n > 0 => {
+                        tracing::warn!("dropped {n} index entries whose blobs are missing on disk")
+                    }
                     Err(e) => tracing::warn!("blob reconcile: {e}"),
                     _ => {}
                 }
@@ -95,11 +95,27 @@ pub async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn check_auth(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
+fn auth_cache() -> &'static Mutex<Option<String>> {
+    static CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Argon2 is far too slow to run on every blob. The password is loaded once at
+/// startup, so a header that has already passed is accepted for the life of
+/// the process. The one verification runs off the async runtime.
+async fn check_auth(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or(StatusCode::UNAUTHORIZED)?
+        .to_string();
+    if auth_cache()
+        .lock()
+        .map(|g| g.as_deref() == Some(auth.as_str()))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
     let rest = auth
         .strip_prefix("Basic ")
         .ok_or(StatusCode::UNAUTHORIZED)?;
@@ -107,11 +123,20 @@ fn check_auth(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
         .decode(rest)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let pair = String::from_utf8(decoded).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let (user, pass) = pair
-        .split_once(':')
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    if user != state.config.username || !verify_password(pass, &state.config.password_hash) {
+    let (user, pass) = pair.split_once(':').ok_or(StatusCode::UNAUTHORIZED)?;
+    if user != state.config.username {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    let pass = pass.to_string();
+    let hash = state.config.password_hash.clone();
+    let ok = tokio::task::spawn_blocking(move || verify_password(&pass, &hash))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !ok {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if let Ok(mut guard) = auth_cache().lock() {
+        *guard = Some(auth);
     }
     Ok(())
 }
@@ -137,15 +162,11 @@ async fn get_index(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<IndexResponse>, StatusCode> {
-    check_auth(&headers, &state)?;
-    let mut files = state
-        .couch
-        .list_current_files()
-        .await
-        .map_err(|e| {
-            tracing::error!("index files: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    check_auth(&headers, &state).await?;
+    let mut files = state.couch.list_current_files().await.map_err(|e| {
+        tracing::error!("index files: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     // Never advertise a current file whose blob is gone or that we refuse to sync.
     files.retain(|f| {
         !mimic_core::is_ignored(&f.path)
@@ -175,7 +196,7 @@ async fn get_versions(
     headers: HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> Result<Json<VersionsResponse>, StatusCode> {
-    check_auth(&headers, &state)?;
+    check_auth(&headers, &state).await?;
     let versions = state.couch.versions_for(&q.path).await.map_err(|e| {
         tracing::error!("versions: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -191,12 +212,12 @@ async fn get_blob(
     headers: HeaderMap,
     Query(q): Query<BlobQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state)?;
-    let data = state.read_blob(&q.path, q.ts).await.map_err(|_| StatusCode::NOT_FOUND)?;
-    Ok((
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        data,
-    ))
+    check_auth(&headers, &state).await?;
+    let data = state
+        .read_blob(&q.path, q.ts)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], data))
 }
 
 async fn put_blob(
@@ -205,7 +226,7 @@ async fn put_blob(
     Query(meta): Query<PutBlobMeta>,
     body: Bytes,
 ) -> Result<Json<PutBlobResponse>, StatusCode> {
-    check_auth(&headers, &state)?;
+    check_auth(&headers, &state).await?;
     if mimic_core::is_ignored(&meta.path) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -224,7 +245,7 @@ async fn post_tombstone(
     headers: HeaderMap,
     Json(req): Json<TombstoneRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    check_auth(&headers, &state)?;
+    check_auth(&headers, &state).await?;
     state
         .couch
         .add_tombstone(&req.tombstone)
@@ -241,7 +262,7 @@ async fn post_restore(
     headers: HeaderMap,
     Json(req): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>, StatusCode> {
-    check_auth(&headers, &state)?;
+    check_auth(&headers, &state).await?;
     let data = state
         .read_blob(&req.path, req.ts)
         .await
@@ -260,7 +281,7 @@ async fn post_restore_tree(
     headers: HeaderMap,
     Json(req): Json<RestoreTreeRequest>,
 ) -> Result<Json<RestoreTreeResponse>, StatusCode> {
-    check_auth(&headers, &state)?;
+    check_auth(&headers, &state).await?;
     let prefix = req.path.trim_matches('/').to_string();
     if prefix.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -295,10 +316,7 @@ async fn post_restore_tree(
             }
         }
         let Some(entry) = chosen else {
-            tracing::warn!(
-                "restore-tree skip {}: no readable blob on disk",
-                tip.path
-            );
+            tracing::warn!("restore-tree skip {}: no readable blob on disk", tip.path);
             continue;
         };
         if let Err(e) = state.couch.resurrect_entry(&entry).await {

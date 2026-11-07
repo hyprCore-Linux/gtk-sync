@@ -61,8 +61,7 @@ pub fn run(
         anyhow::bail!("username and password are required");
     }
 
-    let config_path =
-        config_path.unwrap_or_else(|| PathBuf::from("/etc/gtk-sync/server.toml"));
+    let config_path = config_path.unwrap_or_else(|| PathBuf::from("/etc/gtk-sync/server.toml"));
     let data_dir = root.clone();
     std::fs::create_dir_all(data_dir.join("versions"))?;
 
@@ -106,7 +105,10 @@ pub fn run(
     println!("  metadata: CouchDB {} / {}", cfg.couch_url, cfg.couch_db);
     println!("Cert fingerprint: {fp}");
     println!();
-    println!("Start with: gtk-sync run --config {}", config_path.display());
+    println!(
+        "Start with: gtk-sync run --config {}",
+        config_path.display()
+    );
     println!("Or enable systemd: sudo systemctl enable --now gtk-sync");
     Ok(())
 }

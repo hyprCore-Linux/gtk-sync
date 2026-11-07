@@ -5,7 +5,11 @@ use std::fs;
 use std::path::Path;
 
 /// Generate a self-signed cert+key PEM pair for `name` (hostname).
-pub fn generate_self_signed(cert_path: &Path, key_path: &Path, name: &str) -> anyhow::Result<String> {
+pub fn generate_self_signed(
+    cert_path: &Path,
+    key_path: &Path,
+    name: &str,
+) -> anyhow::Result<String> {
     if let Some(p) = cert_path.parent() {
         fs::create_dir_all(p)?;
     }
@@ -13,7 +17,11 @@ pub fn generate_self_signed(cert_path: &Path, key_path: &Path, name: &str) -> an
         fs::create_dir_all(p)?;
     }
 
-    let mut params = CertificateParams::new(vec![name.to_string(), "localhost".into(), "127.0.0.1".into()])?;
+    let mut params = CertificateParams::new(vec![
+        name.to_string(),
+        "localhost".into(),
+        "127.0.0.1".into(),
+    ])?;
     params.subject_alt_names = vec![
         SanType::DnsName(name.try_into()?),
         SanType::DnsName("localhost".try_into()?),

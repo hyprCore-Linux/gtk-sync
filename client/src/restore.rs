@@ -116,11 +116,7 @@ pub async fn restore(config_path: &Path, path: &str, ts: u64) -> anyhow::Result<
     if !restored {
         // Direct blob fetch of historical version
         for peer in &peers {
-            let url = format!(
-                "{}/v1/blob?path={}&ts={ts}",
-                peer.base,
-                encode_path(path)
-            );
+            let url = format!("{}/v1/blob?path={}&ts={ts}", peer.base, encode_path(path));
             if let Ok(r) = client
                 .get(&url)
                 .header("Authorization", &peer.auth)
@@ -136,8 +132,7 @@ pub async fn restore(config_path: &Path, path: &str, ts: u64) -> anyhow::Result<
                     std::fs::write(&dest, &data)?;
                     // Re-upload as new version
                     for other in &peers {
-                        let put_url =
-                            format!("{}/v1/blob?path={}", other.base, encode_path(path));
+                        let put_url = format!("{}/v1/blob?path={}", other.base, encode_path(path));
                         let _ = client
                             .put(&put_url)
                             .header("Authorization", &other.auth)

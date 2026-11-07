@@ -8,11 +8,14 @@ use mimic_core::is_ignored;
 use mimic_core::protocol::{IndexResponse, PutBlobResponse, TombstoneRequest, VersionsResponse};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::{mpsc, Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 /// While applying remote tombstones locally, ignore Remove events so we don't
 /// re-POST thousands of tombstones and starve the reconcile loop.
@@ -38,10 +41,78 @@ fn clear_self_writes() {
     }
 }
 
+/// In-flight transfers. Large files take several permits so a few big blobs
+/// cannot pin the whole budget (each transfer still buffers the file).
+const TRANSFER_PERMITS: usize = 16;
+const LARGE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const LARGE_FILE_PERMITS: u32 = 8;
+const PEER_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
 pub struct HttpPeer {
     pub base: String,
     pub auth: String,
     pub name: String,
+}
+
+fn transfer_permits(size: u64) -> u32 {
+    if size > LARGE_FILE_BYTES {
+        LARGE_FILE_PERMITS
+    } else {
+        1
+    }
+}
+
+/// Run jobs with a shared permit budget. A permit is held only while the job runs.
+async fn run_jobs<T, I, F, Fut>(items: I) -> Vec<T>
+where
+    I: IntoIterator<Item = (u32, F)>,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let sem = Arc::new(Semaphore::new(TRANSFER_PERMITS));
+    let mut set = JoinSet::new();
+    for (weight, make) in items {
+        let weight = weight.clamp(1, TRANSFER_PERMITS as u32);
+        let Ok(permit) = sem.clone().acquire_many_owned(weight).await else {
+            break;
+        };
+        set.spawn(async move {
+            let _permit = permit;
+            make().await
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(value) => out.push(value),
+            Err(e) => tracing::warn!("sync task failed: {e}"),
+        }
+    }
+    out
+}
+
+static PEER_CACHE: LazyLock<Mutex<Option<(Instant, Vec<HttpPeer>)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn cached_peers() -> Option<Vec<HttpPeer>> {
+    let guard = PEER_CACHE.lock().ok()?;
+    let (at, peers) = guard.as_ref()?;
+    if at.elapsed() < PEER_CACHE_TTL {
+        Some(peers.clone())
+    } else {
+        None
+    }
+}
+
+fn store_peers(peers: &[HttpPeer]) {
+    if peers.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = PEER_CACHE.lock() {
+        *guard = Some((Instant::now(), peers.to_vec()));
+    }
 }
 
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -71,13 +142,18 @@ pub fn encode_path(s: &str) -> String {
 }
 
 pub async fn resolve_peers(cfg: &ClientConfig) -> Vec<HttpPeer> {
+    if let Some(peers) = cached_peers() {
+        return peers;
+    }
+    let peers = discover_peers(cfg).await;
+    store_peers(&peers);
+    peers
+}
+
+async fn discover_peers(cfg: &ClientConfig) -> Vec<HttpPeer> {
     let auth = basic_auth(&cfg.username, &cfg.password);
-    let mut peers: Vec<DiscoveredPeer> = cfg
-        .peers
-        .iter()
-        .filter(|p| !p.excluded)
-        .cloned()
-        .collect();
+    let mut peers: Vec<DiscoveredPeer> =
+        cfg.peers.iter().filter(|p| !p.excluded).cloned().collect();
 
     for s in &cfg.static_peers {
         if let Some((host, port)) = s.split_once(':') {
@@ -107,7 +183,10 @@ pub async fn resolve_peers(cfg: &ClientConfig) -> Vec<HttpPeer> {
         .into_iter()
         .filter(|p| !p.excluded)
         .fold(Vec::new(), |mut acc, p| {
-            if !acc.iter().any(|x: &DiscoveredPeer| x.host == p.host && x.port == p.port) {
+            if !acc
+                .iter()
+                .any(|x: &DiscoveredPeer| x.host == p.host && x.port == p.port)
+            {
                 acc.push(p);
             }
             acc
@@ -139,11 +218,12 @@ pub async fn run(config_path: PathBuf) -> anyhow::Result<()> {
     watcher.watch(&cfg.root, RecursiveMode::Recursive)?;
 
     let mut hash_cache = scan::HashCache::load();
+    let client = http_client()?;
 
     // Initial full sync — scanning is not "busy" for the sidebar (large trees
     // can take minutes); only pull/push transfers flip the syncing icon.
     status::set_phase("scanning", false);
-    if let Err(e) = full_sync(&cfg, &rx, &mut hash_cache).await {
+    if let Err(e) = full_sync(&cfg, &client, &rx, &mut hash_cache).await {
         tracing::warn!("initial sync: {e}");
     }
     hash_cache.save();
@@ -157,7 +237,7 @@ pub async fn run(config_path: PathBuf) -> anyhow::Result<()> {
         while handled < 24 {
             match rx.try_recv() {
                 Ok(event) => {
-                    if let Err(e) = handle_fs_event(&cfg, &event).await {
+                    if let Err(e) = handle_fs_event(&cfg, &client, &event).await {
                         tracing::warn!("fs event: {e}");
                     }
                     handled += 1;
@@ -173,7 +253,7 @@ pub async fn run(config_path: PathBuf) -> anyhow::Result<()> {
         // Periodic reconcile
         if last_scan.elapsed() > Duration::from_secs(10) {
             status::set_phase("scanning", false);
-            if let Err(e) = full_sync(&cfg, &rx, &mut hash_cache).await {
+            if let Err(e) = full_sync(&cfg, &client, &rx, &mut hash_cache).await {
                 tracing::debug!("periodic sync: {e}");
             }
             hash_cache.save();
@@ -181,6 +261,7 @@ pub async fn run(config_path: PathBuf) -> anyhow::Result<()> {
             last_scan = std::time::Instant::now();
         }
 
+        status::flush();
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -197,20 +278,24 @@ enum PullResult {
 
 async fn full_sync(
     cfg: &ClientConfig,
+    client: &reqwest::Client,
     rx: &mpsc::Receiver<notify::Event>,
     cache: &mut scan::HashCache,
 ) -> anyhow::Result<()> {
-    let client = http_client()?;
-    let peers = resolve_peers(cfg).await;
+    let cfg = Arc::new(cfg.clone());
+    let peers = resolve_peers(&cfg).await;
     if peers.is_empty() {
         tracing::debug!("no peers yet");
         status::publish_reconcile(std::collections::BTreeMap::new(), &[]);
         return Ok(());
     }
 
-    // Merge remote indexes (LWW by ts)
+    // Merge remote indexes (LWW by ts). Remember which peer owns the winning
+    // version so pulls do not scan every peer's file list per path.
     let mut merged = FileIndex::default();
-    let mut peer_indexes: Vec<(HttpPeer, IndexResponse)> = Vec::new();
+    let mut reachable: Vec<HttpPeer> = Vec::new();
+    let mut peer_for_path: HashMap<String, usize> = HashMap::new();
+    let mut seen_tombs: HashSet<(String, u64)> = HashSet::new();
 
     for peer in &peers {
         let url = format!("{}/v1/index", peer.base);
@@ -222,6 +307,7 @@ async fn full_sync(
         {
             Ok(r) if r.status().is_success() => {
                 let idx: IndexResponse = r.json().await?;
+                let peer_idx = reachable.len();
                 for f in &idx.files {
                     if is_ignored(&f.path) {
                         continue;
@@ -232,6 +318,7 @@ async fn full_sync(
                     };
                     if take {
                         merged.files.insert(f.path.clone(), f.clone());
+                        peer_for_path.insert(f.path.clone(), peer_idx);
                     }
                     merged
                         .history
@@ -243,22 +330,11 @@ async fn full_sync(
                     if is_ignored(&t.path) {
                         continue;
                     }
-                    if !merged
-                        .tombstones
-                        .iter()
-                        .any(|x| x.path == t.path && x.ts == t.ts)
-                    {
+                    if seen_tombs.insert((t.path.clone(), t.ts)) {
                         merged.tombstones.push(t.clone());
                     }
                 }
-                peer_indexes.push((
-                    HttpPeer {
-                        base: peer.base.clone(),
-                        auth: peer.auth.clone(),
-                        name: peer.name.clone(),
-                    },
-                    idx,
-                ));
+                reachable.push(peer.clone());
             }
             Ok(r) => tracing::debug!("{} index: {}", peer.name, r.status()),
             Err(e) => tracing::debug!("{} unreachable: {e}", peer.name),
@@ -268,7 +344,14 @@ async fn full_sync(
     // Publish tombstones immediately — do not wait for pull/push/hashing.
     status::publish_tombstones(&merged.tombstones);
 
-    let local = scan::local_file_map(&cfg.root, cache)?;
+    let mut local = scan::local_file_map(&cfg.root, cache)?;
+    let mut live_paths: Vec<String> = merged.files.keys().cloned().collect();
+    live_paths.sort();
+    let mut local_by_mtime: Vec<(String, u64)> = local
+        .iter()
+        .map(|(path, (mtime, _))| (path.clone(), *mtime))
+        .collect();
+    local_by_mtime.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Apply remote deletes (tombstones) locally if local file older/missing awareness
     APPLYING_REMOTE_DELETES.store(true, Ordering::SeqCst);
@@ -276,19 +359,12 @@ async fn full_sync(
         if matches!(t.kind, TombstoneKind::Delete) {
             // Partial folder restore: live index files under this path must not be wiped
             // by a leftover parent tombstone.
-            let prefix_slash = format!("{}/", t.path);
-            let has_live = merged.files.keys().any(|p| {
-                *p == t.path || p.starts_with(&prefix_slash)
-            });
-            if has_live {
+            if has_path_under(&live_paths, &t.path) {
                 continue;
             }
             // A folder deleted and recreated in the same breath still has the
             // tombstone, but new files under it must not be wiped.
-            let has_newer_local = local.iter().any(|(p, (mtime, _))| {
-                (*p == t.path || p.starts_with(&prefix_slash)) && *mtime > t.ts
-            });
-            if has_newer_local {
+            if any_newer_local(&local_by_mtime, &t.path, t.ts) {
                 continue;
             }
             let paths: Vec<String> = std::iter::once(t.path.clone())
@@ -310,6 +386,9 @@ async fn full_sync(
                     }
                     tracing::info!("applied delete for {p}");
                 }
+                // Keep the in-memory map aligned with disk so a later push does
+                // not try to read a file this tombstone just removed.
+                forget_tree(&mut local, &p);
             }
         }
     }
@@ -319,11 +398,9 @@ async fn full_sync(
 
     // Files that left the tree since the last scan (delete, or cut/paste rename).
     // Tombstone them before pull, or the server copy is written straight back.
-    propagate_local_deletes(&client, &peers, &mut merged, cache).await;
+    propagate_local_deletes(client, &peers, &mut merged, cache).await;
 
-    let mut missing_blobs: HashSet<String> = HashSet::new();
-
-    // Pull newer remote files
+    let mut pulls = Vec::new();
     for (path, entry) in &merged.files {
         if is_ignored(path) {
             continue;
@@ -334,55 +411,111 @@ async fn full_sync(
             Some((mtime, _)) if *mtime >= entry.ts => false,
             _ => true,
         };
-        if need_pull {
-            let result = if let Some((peer, _)) = peer_indexes.iter().find(|(_, idx)| {
-                idx.files.iter().any(|f| f.path == *path && f.ts == entry.ts)
-            }) {
-                pull_file(cfg, &client, peer, path, entry.ts).await
-            } else if let Some((peer, _)) = peer_indexes.first() {
-                pull_file(cfg, &client, peer, path, entry.ts).await
-            } else {
-                Ok(PullResult::Written)
-            };
-            match result {
-                Ok(PullResult::MissingBlob) => {
-                    missing_blobs.insert(path.clone());
-                }
-                Err(e) => tracing::warn!("pull {path}: {e}"),
-                Ok(_) => {}
+        if !need_pull {
+            continue;
+        }
+        let Some(peer) = peer_for_path
+            .get(path)
+            .map(|&i| reachable[i].clone())
+            .or_else(|| reachable.first().cloned())
+        else {
+            continue;
+        };
+        pulls.push((
+            transfer_permits(entry.size),
+            path.clone(),
+            entry.ts,
+            entry.hash.clone(),
+            entry.size,
+            peer,
+        ));
+    }
+    if pulls.len() > 1 {
+        tracing::info!(
+            "pulling {} files ({} at a time)",
+            pulls.len(),
+            TRANSFER_PERMITS
+        );
+    }
+    let client_pull = client.clone();
+    let pull_results = run_jobs(
+        pulls
+            .into_iter()
+            .map(|(permits, path, ts, hash, size, peer)| {
+                let cfg = Arc::clone(&cfg);
+                let client = client_pull.clone();
+                (permits, move || async move {
+                    let result = pull_file(&cfg, &client, &peer, &path, ts).await;
+                    (path, ts, hash, size, result)
+                })
+            }),
+    )
+    .await;
+
+    let mut missing_blobs: HashSet<String> = HashSet::new();
+    for (path, ts, hash, size, result) in pull_results {
+        match result {
+            Ok(PullResult::MissingBlob) => {
+                missing_blobs.insert(path);
             }
+            Ok(PullResult::Written) => {
+                local.insert(path.clone(), (ts, hash.clone()));
+                cache.remember(&path, ts, size, &hash);
+            }
+            Err(e) => tracing::warn!("pull {path}: {e}"),
         }
     }
 
     // Push local files that are newer, missing remotely, or whose server blob 404'd.
-    let local = scan::local_file_map(&cfg.root, cache)?;
-    let mut to_push: Vec<String> = Vec::new();
-    for (path, (mtime, hash)) in &local {
+    let mut to_push: Vec<(u32, String)> = Vec::new();
+    for (path, (_mtime, hash)) in &local {
         let remote = merged.files.get(path);
         let need_push = match remote {
             Some(e) if &e.hash == hash && !missing_blobs.contains(path) => false,
             Some(_) => true,
             None => true,
         };
-        let _ = mtime;
         if need_push {
-            to_push.push(path.clone());
+            let size = std::fs::metadata(cfg.root.join(path))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            to_push.push((transfer_permits(size), path.clone()));
         }
     }
-    status::mark_pending(&to_push);
+    let pending_paths: Vec<String> = to_push.iter().map(|(_, p)| p.clone()).collect();
+    status::mark_pending(&pending_paths);
+    if to_push.len() > 1 {
+        tracing::info!(
+            "pushing {} files ({} at a time)",
+            to_push.len(),
+            TRANSFER_PERMITS
+        );
+    }
+    let client_push = client.clone();
+    let peers_push = peers.clone();
+    let push_results = run_jobs(to_push.into_iter().map(|(permits, path)| {
+        let cfg = Arc::clone(&cfg);
+        let client = client_push.clone();
+        let peers = peers_push.clone();
+        (permits, move || async move {
+            let result = push_file_to_all(&cfg, &client, &peers, &path).await;
+            (path, result)
+        })
+    }))
+    .await;
+
     let mut pushed: HashSet<String> = HashSet::new();
-    for path in &to_push {
-        match push_file_to_all(cfg, &client, &peers, path).await {
+    for (path, result) in push_results {
+        match result {
             Ok(()) => {
-                pushed.insert(path.clone());
-                status::clear_unavailable(path);
+                status::clear_unavailable(&path);
+                pushed.insert(path);
             }
             Err(e) => tracing::warn!("push {path}: {e}"),
         }
     }
 
     // Publish reconciled per-file states for gtk-files.
-    let local = scan::local_file_map(&cfg.root, cache)?;
     let mut file_states = std::collections::BTreeMap::new();
     for (path, entry) in &merged.files {
         if is_ignored(path) {
@@ -412,6 +545,36 @@ async fn full_sync(
     Ok(())
 }
 
+/// True when `sorted` (ascending) contains `path` or any path under it.
+fn has_path_under(sorted: &[String], path: &str) -> bool {
+    if sorted.binary_search_by(|p| p.as_str().cmp(path)).is_ok() {
+        return true;
+    }
+    let prefix = format!("{path}/");
+    let i = sorted.partition_point(|p| p.as_str() < prefix.as_str());
+    sorted.get(i).is_some_and(|p| p.starts_with(&prefix))
+}
+
+/// True when a local file at `path` or under it is newer than `ts`.
+fn any_newer_local(sorted: &[(String, u64)], path: &str, ts: u64) -> bool {
+    if let Ok(i) = sorted.binary_search_by(|e| e.0.as_str().cmp(path)) {
+        if sorted[i].1 > ts {
+            return true;
+        }
+    }
+    let prefix = format!("{path}/");
+    let i = sorted.partition_point(|e| e.0.as_str() < prefix.as_str());
+    sorted[i..]
+        .iter()
+        .take_while(|e| e.0.starts_with(&prefix))
+        .any(|e| e.1 > ts)
+}
+
+fn forget_tree(local: &mut HashMap<String, (u64, String)>, path: &str) {
+    let prefix = format!("{path}/");
+    local.retain(|p, _| p != path && !p.starts_with(&prefix));
+}
+
 async fn pull_file(
     cfg: &ClientConfig,
     client: &reqwest::Client,
@@ -420,11 +583,7 @@ async fn pull_file(
     ts: u64,
 ) -> anyhow::Result<PullResult> {
     status::begin_transfer(path, "down");
-    let url = format!(
-        "{}/v1/blob?path={}&ts={ts}",
-        peer.base,
-        encode_path(path)
-    );
+    let url = format!("{}/v1/blob?path={}&ts={ts}", peer.base, encode_path(path));
     let result = async {
         let resp = client
             .get(&url)
@@ -488,11 +647,7 @@ async fn push_file_to_all(
         let mut any_ok = false;
         let mut last_err: Option<String> = None;
         for peer in peers {
-            let url = format!(
-                "{}/v1/blob?path={}&ts={ts}",
-                peer.base,
-                encode_path(path)
-            );
+            let url = format!("{}/v1/blob?path={}&ts={ts}", peer.base, encode_path(path));
             match client
                 .put(&url)
                 .header("Authorization", &peer.auth)
@@ -548,7 +703,12 @@ async fn push_file_to_all(
 
 /// True when the server has a different, newer edit than the copy we last hashed.
 /// A matching hash means the local file was simply removed (delete or rename).
-fn remote_edit_wins(cached_hash: &str, cached_mtime: u64, remote_hash: &str, remote_ts: u64) -> bool {
+fn remote_edit_wins(
+    cached_hash: &str,
+    cached_mtime: u64,
+    remote_hash: &str,
+    remote_ts: u64,
+) -> bool {
     cached_hash != remote_hash && remote_ts > cached_mtime
 }
 
@@ -559,6 +719,7 @@ async fn propagate_local_deletes(
     cache: &mut scan::HashCache,
 ) {
     let absent = cache.take_absent();
+    let mut pending = Vec::new();
     for ent in absent {
         if is_ignored(&ent.path) {
             continue;
@@ -570,11 +731,25 @@ async fn propagate_local_deletes(
             tracing::info!("remote newer than local delete, will pull {}", ent.path);
             continue;
         }
-        let remote_path = remote.path.clone();
-        match post_tombstone(client, peers, &remote_path, Vec::new()).await {
+        pending.push(ent);
+    }
+    let client = client.clone();
+    let peers = peers.to_vec();
+    let results = run_jobs(pending.into_iter().map(|ent| {
+        let client = client.clone();
+        let peers = peers.clone();
+        let path = ent.path.clone();
+        (1, move || async move {
+            let result = post_tombstone(&client, &peers, &path, Vec::new()).await;
+            (ent, result)
+        })
+    }))
+    .await;
+    for (ent, result) in results {
+        match result {
             Ok(()) => {
                 merged.files.remove(&ent.path);
-                tracing::info!("propagated local delete {remote_path}");
+                tracing::info!("propagated local delete {}", ent.path);
             }
             Err(e) => {
                 tracing::warn!("tombstone {}: {e}", ent.path);
@@ -634,7 +809,10 @@ async fn post_tombstone(
 fn file_mtime(path: &Path) -> Option<u64> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
-    modified.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 fn is_regular_file(path: &Path) -> bool {
@@ -645,12 +823,15 @@ fn path_missing(path: &Path) -> bool {
     path.symlink_metadata().is_err()
 }
 
-async fn handle_fs_event(cfg: &ClientConfig, event: &notify::Event) -> anyhow::Result<()> {
+async fn handle_fs_event(
+    cfg: &ClientConfig,
+    client: &reqwest::Client,
+    event: &notify::Event,
+) -> anyhow::Result<()> {
     if APPLYING_REMOTE_DELETES.load(Ordering::Relaxed) {
         return Ok(());
     }
 
-    let client = http_client()?;
     let peers = resolve_peers(cfg).await;
     if peers.is_empty() {
         return Ok(());
@@ -683,25 +864,48 @@ async fn handle_fs_event(cfg: &ClientConfig, event: &notify::Event) -> anyhow::R
                     to_tombstone.push(rel);
                 }
             }
-            push_existing_files(cfg, &client, &peers, &to_push_paths).await;
-            for rel in to_tombstone {
-                if let Err(e) = post_tombstone(&client, &peers, &rel, Vec::new()).await {
+            push_existing_files(cfg, client, &peers, &to_push_paths).await;
+            let client = client.clone();
+            let peers = peers.clone();
+            let results = run_jobs(to_tombstone.into_iter().map(|rel| {
+                let client = client.clone();
+                let peers = peers.clone();
+                (1, move || async move {
+                    let result = post_tombstone(&client, &peers, &rel, Vec::new()).await;
+                    (rel, result)
+                })
+            }))
+            .await;
+            for (rel, result) in results {
+                if let Err(e) = result {
                     tracing::warn!("tombstone {rel}: {e}");
                 }
             }
         }
         EventKind::Remove(_) => {
+            let mut tombs = Vec::new();
             for path in &event.paths {
                 if let Some(rel) = mimic_core::index::relative_path(&cfg.root, path) {
                     if is_ignored(&rel) {
                         continue;
                     }
-                    if let Err(e) =
-                        post_tombstone(&client, &peers, &rel, collect_former_children(cfg, &rel))
-                            .await
-                    {
-                        tracing::warn!("tombstone {rel}: {e}");
-                    }
+                    tombs.push((rel.clone(), collect_former_children(cfg, &rel)));
+                }
+            }
+            let client = client.clone();
+            let peers = peers.clone();
+            let results = run_jobs(tombs.into_iter().map(|(rel, children)| {
+                let client = client.clone();
+                let peers = peers.clone();
+                (1, move || async move {
+                    let result = post_tombstone(&client, &peers, &rel, children).await;
+                    (rel, result)
+                })
+            }))
+            .await;
+            for (rel, result) in results {
+                if let Err(e) = result {
+                    tracing::warn!("tombstone {rel}: {e}");
                 }
             }
         }
@@ -728,8 +932,30 @@ async fn push_existing_files(
     // Mark the whole burst pending first so gtk-files doesn't show checkmarks
     // on files that have not been uploaded yet.
     status::mark_pending(&to_push);
-    for rel in &to_push {
-        if let Err(e) = push_file_to_all(cfg, client, peers, rel).await {
+    let cfg = Arc::new(cfg.clone());
+    let client = client.clone();
+    let peers = peers.to_vec();
+    let jobs: Vec<(u32, String)> = to_push
+        .into_iter()
+        .map(|rel| {
+            let size = std::fs::metadata(cfg.root.join(&rel))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            (transfer_permits(size), rel)
+        })
+        .collect();
+    let results = run_jobs(jobs.into_iter().map(|(permits, rel)| {
+        let cfg = Arc::clone(&cfg);
+        let client = client.clone();
+        let peers = peers.clone();
+        (permits, move || async move {
+            let result = push_file_to_all(&cfg, &client, &peers, &rel).await;
+            (rel, result)
+        })
+    }))
+    .await;
+    for (rel, result) in results {
+        if let Err(e) = result {
             tracing::warn!("push {rel}: {e}");
         }
     }
@@ -759,7 +985,9 @@ pub async fn fetch_versions(
             if r.status().is_success() {
                 let resp: VersionsResponse = r.json().await?;
                 for v in resp.versions {
-                    if !all.iter().any(|e: &mimic_core::index::FileEntry| e.ts == v.ts && e.hash == v.hash)
+                    if !all
+                        .iter()
+                        .any(|e: &mimic_core::index::FileEntry| e.ts == v.ts && e.hash == v.hash)
                     {
                         all.push(v);
                     }
@@ -773,7 +1001,9 @@ pub async fn fetch_versions(
 
 #[cfg(test)]
 mod tests {
-    use super::remote_edit_wins;
+    use super::{
+        any_newer_local, has_path_under, remote_edit_wins, transfer_permits, LARGE_FILE_BYTES,
+    };
 
     #[test]
     fn matching_hash_is_a_local_delete() {
@@ -789,5 +1019,30 @@ mod tests {
     #[test]
     fn older_remote_hash_loses_to_local_delete() {
         assert!(!remote_edit_wins("abc", 200, "def", 150));
+    }
+
+    #[test]
+    fn large_files_take_more_permits() {
+        assert_eq!(transfer_permits(0), 1);
+        assert_eq!(transfer_permits(LARGE_FILE_BYTES), 1);
+        assert_eq!(transfer_permits(LARGE_FILE_BYTES + 1), 8);
+    }
+
+    #[test]
+    fn prefix_lookup_finds_children_only() {
+        let paths = vec!["a".into(), "a/b".into(), "a/c".into(), "dir2/file".into()];
+        assert!(has_path_under(&paths, "a"));
+        assert!(has_path_under(&paths, "a/b"));
+        assert!(!has_path_under(&paths, "a/d"));
+        assert!(!has_path_under(&paths, "dir"));
+        assert!(has_path_under(&paths, "dir2"));
+    }
+
+    #[test]
+    fn newer_local_child_blocks_tombstone() {
+        let local = vec![("dir/old".into(), 10u64), ("dir/new".into(), 50)];
+        assert!(any_newer_local(&local, "dir", 20));
+        assert!(!any_newer_local(&local, "dir", 50));
+        assert!(!any_newer_local(&local, "dir2", 0));
     }
 }

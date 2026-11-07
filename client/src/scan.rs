@@ -64,6 +64,18 @@ impl HashCache {
         std::mem::take(&mut self.last_absent)
     }
 
+    /// Record a file we just wrote (a pull) so the next walk does not rehash it.
+    pub fn remember(&mut self, path: &str, mtime: u64, size: u64, hash: &str) {
+        self.files.insert(
+            path.to_string(),
+            CacheEnt {
+                mtime,
+                size,
+                hash: hash.to_string(),
+            },
+        );
+    }
+
     /// Put a path back so a failed tombstone is retried on the next scan.
     pub fn remember_absent(&mut self, ent: &AbsentEnt) {
         self.files.insert(
@@ -78,12 +90,14 @@ impl HashCache {
 }
 
 /// Relative path → (mtime, sha256). Skips venvs, `.git`, symlinks, etc.
+/// Cache misses are hashed across threads; unchanged files keep the mtime/size cache.
 pub fn local_file_map(
     root: &Path,
     cache: &mut HashCache,
 ) -> anyhow::Result<HashMap<String, (u64, String)>> {
     let mut map = HashMap::new();
     let mut seen = HashSet::new();
+    let mut misses: Vec<(String, PathBuf, u64, u64)> = Vec::new();
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
         if e.depth() == 0 {
             return true;
@@ -115,26 +129,23 @@ pub fn local_file_map(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let size = meta.len();
-        let hash = match cache.files.get(&rel) {
-            Some(ent) if ent.mtime == mtime && ent.size == size => ent.hash.clone(),
-            _ => match content_hash_path(entry.path()) {
-                Ok(h) => {
-                    cache.files.insert(
-                        rel.clone(),
-                        CacheEnt {
-                            mtime,
-                            size,
-                            hash: h.clone(),
-                        },
-                    );
-                    h
-                }
-                Err(e) => {
-                    tracing::warn!("hash {rel}: {e}");
-                    continue;
-                }
+        match cache.files.get(&rel) {
+            Some(ent) if ent.mtime == mtime && ent.size == size => {
+                seen.insert(rel.clone());
+                map.insert(rel, (mtime, ent.hash.clone()));
+            }
+            _ => misses.push((rel, entry.path().to_path_buf(), mtime, size)),
+        }
+    }
+    for (rel, mtime, size, hash) in hash_misses(&misses) {
+        cache.files.insert(
+            rel.clone(),
+            CacheEnt {
+                mtime,
+                size,
+                hash: hash.clone(),
             },
-        };
+        );
         seen.insert(rel.clone());
         map.insert(rel, (mtime, hash));
     }
@@ -151,4 +162,58 @@ pub fn local_file_map(
         .collect();
     cache.files.retain(|k, _| seen.contains(k));
     Ok(map)
+}
+
+fn hash_misses(misses: &[(String, PathBuf, u64, u64)]) -> Vec<(String, u64, u64, String)> {
+    if misses.is_empty() {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, misses.len());
+    let mut out = Vec::with_capacity(misses.len());
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::new();
+                for (rel, path, mtime, size) in misses.iter().skip(worker).step_by(workers) {
+                    match content_hash_path(path) {
+                        Ok(hash) => local.push((rel.clone(), *mtime, *size, hash)),
+                        Err(e) => tracing::warn!("hash {rel}: {e}"),
+                    }
+                }
+                local
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => out.extend(part),
+                Err(_) => tracing::warn!("hash worker panicked"),
+            }
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn hashes_files_in_parallel_and_reuses_cache() {
+        let dir = std::env::temp_dir().join(format!("gtk-sync-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), b"alpha").unwrap();
+        fs::write(dir.join("sub/b.txt"), b"beta").unwrap();
+        let mut cache = HashCache::default();
+        let map = local_file_map(&dir, &mut cache).unwrap();
+        assert_eq!(map.len(), 2);
+        let again = local_file_map(&dir, &mut cache).unwrap();
+        assert_eq!(map, again);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

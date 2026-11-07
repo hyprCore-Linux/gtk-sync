@@ -210,12 +210,7 @@ impl FileIndex {
                 } else {
                     // ok
                 }
-                if self
-                    .files
-                    .get(&t.path)
-                    .map(|c| c.ts < t.ts)
-                    .unwrap_or(true)
-                {
+                if self.files.get(&t.path).map(|c| c.ts < t.ts).unwrap_or(true) {
                     self.files.remove(&t.path);
                     for c in &t.children {
                         if self.files.get(c).map(|e| e.ts < t.ts).unwrap_or(true) {

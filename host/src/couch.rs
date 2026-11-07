@@ -74,8 +74,7 @@ impl CouchStore {
         let base = url.trim_end_matches('/').to_string();
         let auth = match (username, password) {
             (Some(u), Some(p)) if !u.is_empty() => {
-                let token =
-                    base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+                let token = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
                 Some(format!("Basic {token}"))
             }
             _ => None,
@@ -127,16 +126,10 @@ impl CouchStore {
         // Mango indexes for type queries
         self.ensure_index("by-type", json!({ "fields": ["type"] }))
             .await?;
-        self.ensure_index(
-            "by-type-path",
-            json!({ "fields": ["type", "path"] }),
-        )
-        .await?;
-        self.ensure_index(
-            "by-type-ts",
-            json!({ "fields": ["type", "ts"] }),
-        )
-        .await?;
+        self.ensure_index("by-type-path", json!({ "fields": ["type", "path"] }))
+            .await?;
+        self.ensure_index("by-type-ts", json!({ "fields": ["type", "ts"] }))
+            .await?;
         Ok(())
     }
 
@@ -232,9 +225,7 @@ impl CouchStore {
     }
 
     pub async fn list_current_files(&self) -> anyhow::Result<Vec<FileEntry>> {
-        let docs = self
-            .find(json!({ "type": "file" }), 100_000)
-            .await?;
+        let docs = self.find(json!({ "type": "file" }), 100_000).await?;
         let mut out = Vec::with_capacity(docs.len());
         for d in docs {
             out.push(FileEntry {
@@ -249,9 +240,7 @@ impl CouchStore {
     }
 
     pub async fn list_tombstones(&self) -> anyhow::Result<Vec<Tombstone>> {
-        let docs = self
-            .find(json!({ "type": "tombstone" }), 100_000)
-            .await?;
+        let docs = self.find(json!({ "type": "tombstone" }), 100_000).await?;
         let mut out = Vec::new();
         for d in docs {
             let kind = match d["kind"].as_str().unwrap_or("delete") {
@@ -280,10 +269,7 @@ impl CouchStore {
 
     pub async fn versions_for(&self, path: &str) -> anyhow::Result<Vec<FileEntry>> {
         let docs = self
-            .find(
-                json!({ "type": "version", "path": path }),
-                10_000,
-            )
+            .find(json!({ "type": "version", "path": path }), 10_000)
             .await?;
         let mut out: Vec<FileEntry> = docs
             .into_iter()
@@ -326,8 +312,7 @@ impl CouchStore {
             size: entry.size,
             stored_name: entry.stored_name.clone(),
         };
-        self.put_raw(&serde_json::to_value(vdoc)?)
-            .await?;
+        self.put_raw(&serde_json::to_value(vdoc)?).await?;
 
         let fid = file_id(&entry.path);
         let replace = match self.get_raw(&fid).await? {
@@ -337,10 +322,7 @@ impl CouchStore {
         if replace {
             // Drop covering tombstones for this path
             let tombs = self
-                .find(
-                    json!({ "type": "tombstone", "path": entry.path }),
-                    1000,
-                )
+                .find(json!({ "type": "tombstone", "path": entry.path }), 1000)
                 .await?;
             for t in tombs {
                 if let Some(id) = t["_id"].as_str() {
@@ -369,9 +351,7 @@ impl CouchStore {
 
     /// Latest historical version for every path under `prefix` (exact or `prefix/…`).
     pub async fn latest_versions_under(&self, prefix: &str) -> anyhow::Result<Vec<FileEntry>> {
-        let vers = self
-            .find(json!({ "type": "version" }), 100_000)
-            .await?;
+        let vers = self.find(json!({ "type": "version" }), 100_000).await?;
         let prefix_slash = format!("{prefix}/");
         let mut best: std::collections::BTreeMap<String, FileEntry> =
             std::collections::BTreeMap::new();
@@ -400,10 +380,7 @@ impl CouchStore {
     /// Point the current file doc at an existing version and drop exact-path tombstones.
     pub async fn resurrect_entry(&self, entry: &FileEntry) -> anyhow::Result<()> {
         let tombs = self
-            .find(
-                json!({ "type": "tombstone", "path": entry.path }),
-                1000,
-            )
+            .find(json!({ "type": "tombstone", "path": entry.path }), 1000)
             .await?;
         for t in tombs {
             if let Some(id) = t["_id"].as_str() {
@@ -432,9 +409,7 @@ impl CouchStore {
 
     /// Delete every tombstone whose path is `prefix` or under `prefix/`.
     pub async fn clear_tombstones_under(&self, prefix: &str) -> anyhow::Result<usize> {
-        let tombs = self
-            .find(json!({ "type": "tombstone" }), 100_000)
-            .await?;
+        let tombs = self.find(json!({ "type": "tombstone" }), 100_000).await?;
         let prefix_slash = format!("{prefix}/");
         let mut n = 0usize;
         for d in tombs {
@@ -507,9 +482,7 @@ impl CouchStore {
             .map(|e| (e.path, e.ts))
             .collect();
 
-        let vers = self
-            .find(json!({ "type": "version" }), 100_000)
-            .await?;
+        let vers = self.find(json!({ "type": "version" }), 100_000).await?;
         for d in vers {
             let path = d["path"].as_str().unwrap_or("");
             let ts = d["ts"].as_u64().unwrap_or(0);
@@ -524,9 +497,7 @@ impl CouchStore {
             }
         }
 
-        let tombs = self
-            .find(json!({ "type": "tombstone" }), 100_000)
-            .await?;
+        let tombs = self.find(json!({ "type": "tombstone" }), 100_000).await?;
         for d in tombs {
             let ts = d["ts"].as_u64().unwrap_or(0);
             if ts < cutoff {
@@ -595,7 +566,10 @@ impl CouchStore {
     }
 
     /// Import from legacy FileIndex JSON (one-shot migration).
-    pub async fn import_file_index(&self, index: &mimic_core::index::FileIndex) -> anyhow::Result<usize> {
+    pub async fn import_file_index(
+        &self,
+        index: &mimic_core::index::FileIndex,
+    ) -> anyhow::Result<usize> {
         let mut n = 0usize;
         for hist in index.history.values() {
             for e in hist {

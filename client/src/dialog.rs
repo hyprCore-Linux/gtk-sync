@@ -75,7 +75,10 @@ pub async fn setup(
     let config_path = config.unwrap_or_else(ClientConfig::default_path);
     cfg.save(&config_path)?;
     println!("Wrote {}", config_path.display());
-    println!("Start with: gtk-sync-client run --config {}", config_path.display());
+    println!(
+        "Start with: gtk-sync-client run --config {}",
+        config_path.display()
+    );
     Ok(())
 }
 
